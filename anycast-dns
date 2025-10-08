@@ -1,0 +1,95 @@
+#!/bin/bash
+set -e
+
+netns_name="everycast"
+host_ips=("172.17.53.1/24" "fc11:ed0:abeb:53::1/64")
+netns_ips=("172.17.53.53/24" "fc11:ed0:abeb:53::53/64")
+host_interface="veth53"
+netns_interface="eth0"
+anycast_ips=("172.23.13.126" "fdfd:4acc:e2:53::53")
+dummy_interface="dummy0"
+
+ip_netns="ip -n $netns_name"
+ip_netns_exec="ip netns exec $netns_name"
+
+is_ipv4() {
+  if sipcalc "$1" | grep -q '^-\[ipv4'; then return 0; else return 1; fi
+}
+
+is_ipv6() {
+  if sipcalc "$1" | grep -q '^-\[ipv6'; then return 0; else return 1; fi
+}
+
+ip_family_opt() {
+  if is_ipv4 "$1"; then echo "-4"; else echo "-6"; fi
+}
+
+ip_get_address() {
+  if is_ipv4 "$1"; then
+    sipcalc "$1" | grep 'Host address[[:blank:]]\+-' | awk '{print $4}'
+  else
+    sipcalc "$1" | grep 'Compressed address[[:blank:]]\+-' | awk '{print $4}'
+  fi
+}
+
+ip_get_prefix() {
+  if is_ipv4 "$1"; then
+    local _output
+    _output="$(sipcalc "$1")"
+    echo "$(echo "$_output" | grep 'Network address' | awk '{print $4}')/$(echo "$_output" | grep 'Network mask (bits)' | awk '{print $5}')"
+  else
+    sipcalc "$1" | grep 'Subnet prefix (masked)' | awk '{print $5}'
+  fi
+}
+
+net_init() {
+  ip netns add "$netns_name"
+
+  ip link add "$host_interface" type veth peer "$netns_interface" netns "$netns_name"
+  for _ip in "${host_ips[@]}"; do
+    ip addr add dev "$host_interface" "$_ip"
+  done
+  for _ip in "${netns_ips[@]}"; do
+    $ip_netns addr add dev "$netns_interface" "$_ip"
+  done
+
+  $ip_netns link add "$dummy_interface" type dummy
+  for _ip in "${anycast_ips[@]}"; do
+    $ip_netns addr add dev "$dummy_interface" "$_ip"
+  done
+
+  ip link set "$host_interface" up
+  $ip_netns link set "$netns_interface" up
+  $ip_netns link set "$dummy_interface" up
+
+  for _ip in "${host_ips[@]}"; do
+    $ip_netns "$(ip_family_opt "$_ip")" route add default via "$(ip_get_address "$_ip")"
+  done
+
+  sysctl -w "net.ipv4.conf.$host_interface.forwarding=1" >/dev/null
+  sysctl -w "net.ipv6.conf.$host_interface.forwarding=1" >/dev/null
+
+  nft add table inet everycast
+  nft add chain inet everycast nat "{ type nat hook postrouting priority srcnat; policy accept; }"
+  nft add rule inet everycast nat iif "$host_interface" masquerade
+}
+
+net_destroy() {
+  set +e
+  ip netns del "$netns_name"
+  ip link del "$host_interface"
+  nft delete table inet everycast
+  [ ! -z "$bird_pid" ] && kill "$bird_pid"
+  [ ! -z "$smartdns_pid" ] && kill "$smartdns_pid"
+}
+
+trap net_destroy EXIT
+net_init
+$ip_netns_exec bird -d -c "${BASH_SOURCE%/*}/bird.conf" -s "${BASH_SOURCE%/*}/bird.sock" &
+bird_pid=$!
+$ip_netns_exec smartdns -f -x -c "${BASH_SOURCE%/*}/smartdns.conf" &
+smartdns_pid=$!
+wait "$smartdns_pid"
+
+# TODO: run bird and smartdns daemon
+# $ip_netns_exec bash
