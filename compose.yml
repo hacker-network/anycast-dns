@@ -3,14 +3,12 @@ networks:
     driver: bridge
     enable_ipv6: true
     ipam:
-      driver: default
       config:
         - subnet: 172.17.32.0/20
         - subnet: fc11:ed0:abeb:53::/64
     driver_opts:
       com.docker.network.bridge.name: docker53
   anycast:
-    driver: macvlan
     enable_ipv6: true
     internal: true
     ipam:
